@@ -1,15 +1,18 @@
 {application, oauth2_s2s, [
 	{description, "Google API OAuth 2.0 for Server to Server Applications"},
-	{vsn, "0.1.0"},
+	{vsn, "0.2.0"},
 	{id, "git"},
 	{modules, []},
 	{registered, []},
 	{applications, [
-		kernel,
-		stdlib,
-	    inets,
-	    jsx,
-	    ssl
+		            kernel,
+		            stdlib,
+                    crypto,
+                    asn1,
+                    public_key,
+	                inets,
+	                jsx,
+	                ssl
 	]},
 	{mod, {oauth2_s2s_app, []}},
 	{env, []}

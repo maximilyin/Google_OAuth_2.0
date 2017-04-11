@@ -1,78 +1,97 @@
 -module(oauth2_s2s).
--export([start/0,get_access_token/0,get_access_token/1]).
+-export([start/0, stop/0]).
 
+-export([get_access_token/0, get_access_token/1]).
 
 -include_lib("public_key/include/public_key.hrl").
-%%path of the RSA key file , check READ me for more info
--define(RSA_KEY_PATH,"oauth_test-6aaebb132d95_RSA.pem").
+
 -define(JWT_HEADER,[{alg, <<"RS256">>}, {typ, <<"JWT">>}]).
 
 start() ->
-    ok = application:start(crypto),
-    ok = application:start(asn1),
-    ok = application:start(public_key),
-    ok =application:start(ssl),
-    ok = application:start(inets),
-    ok = application:start(jsx),
-    ok = application:start(oauth2_s2s),
-    io:format("~n~nstarted oauth2_s2s....~n~n ").
+    start(?MODULE).
 
+stop() ->
+    application:stop(?MODULE).
+
+%% internal
+start(AppName) ->
+    F = fun({App, _, _}) -> App end,
+    RunningApps = lists:map(F, application:which_applications()),
+    ok = load(AppName),
+    {ok, Dependencies} = application:get_key(AppName, applications),
+    [begin
+        ok = start(A)
+    end || A <- Dependencies, not lists:member(A, RunningApps)],
+    ok = application:start(AppName).
+
+load(AppName) ->
+    F = fun({App, _, _}) -> App end,
+    LoadedApps = lists:map(F, application:loaded_applications()),
+    case lists:member(AppName, LoadedApps) of
+        true ->
+            ok;
+        false ->
+            ok = application:load(AppName)
+    end.
 
 %% access token for pubsub api (default here as present in the config file)
 get_access_token() ->
-  {ok, Scope} = application:get_env(oauth2_s2s, scope),
-  access_token(Scope).
+    {ok, Scope} = application:get_env(oauth2_s2s, scope),
+    access_token(Scope).
 
- get_access_token(Scope) ->
+get_access_token(Scope) ->
     access_token(Scope).
 
 access_token(Scope) ->
-  {ok, Host} = application:get_env(oauth2_s2s, host),
-  {ok, Aud} = application:get_env(oauth2_s2s, aud),
-  {ok, Iss} = application:get_env(oauth2_s2s,iss),
-  {ok, GrantType} = application:get_env(oauth2_s2s, grant_type),
-    {ok,EncodedPrivateKey1} = file:read_file(?RSA_KEY_PATH),
-    [PemEntry] = public_key:pem_decode(EncodedPrivateKey1),
+    {ok, Host} = application:get_env(oauth2_s2s, host),
+    {ok, Aud} = application:get_env(oauth2_s2s, aud),
+    {ok, Iss} = application:get_env(oauth2_s2s,iss),
+    {ok, GrantType} = application:get_env(oauth2_s2s, grant_type),
+    {ok, RsaKeyPath} = application:get_env(oauth2_s2s, rsa_key_path),
+    TokenExpTime = application:get_env(oauth2_s2s, token_exp_time, 3600),
+    {ok, EncodedPrivateKey} = file:read_file(RsaKeyPath),
+    [PemEntry] = public_key:pem_decode(EncodedPrivateKey),
     PrivateKey = public_key:pem_entry_decode(PemEntry),
     EncodedJWTHeader = encode_base64(?JWT_HEADER),
-    EncodedJWTClaimSet = encode_base64(jwt_claim_set(Iss, Scope, Aud)),
+    EncodedJWTClaimSet = encode_base64(jwt_claim_set(Iss, Scope, Aud, TokenExpTime)),
     Signature = compute_signature(EncodedJWTHeader, EncodedJWTClaimSet, PrivateKey),
+    Bytes = <<EncodedJWTHeader/binary, ".", EncodedJWTClaimSet/binary, ".", Signature/binary>>,
     Jwt = binary:replace(
-        binary:replace(<<EncodedJWTHeader/binary, ".", EncodedJWTClaimSet/binary, ".", Signature/binary>>,
-                     <<"+">>, <<"-">>, [global]),
-        <<"/">>, <<"_">>, [global]),
-%%    io:format("Jwt::~p~n",[Jwt]),
-    make_http_req(post,Host,
-                    "application/x-www-form-urlencoded",
-                    <<"grant_type=",GrantType/binary,"&assertion=",Jwt/binary>>).
+        binary:replace(Bytes, <<"+">>, <<"-">>, [global]), <<"/">>, <<"_">>, [global]),
+    Body = <<"grant_type=",GrantType/binary,"&assertion=",Jwt/binary>>,
+    http_req(post, Host, "application/x-www-form-urlencoded", Body).
 
 encode_base64(Json) ->
     base64:encode(jsx:encode(Json)).
 
-jwt_claim_set(Iss, Scope, Aud) ->
+jwt_claim_set(Iss, Scope, Aud, TokenExpTime) ->
     [{iss, Iss},
      {scope, Scope},
      {aud, Aud},
-     {exp, calendar:datetime_to_gregorian_seconds(calendar:universal_time()) - 62167219200 + 3600},
-     {iat, calendar:datetime_to_gregorian_seconds(calendar:universal_time()) - 62167219200}].
+     {exp, unix_time() + TokenExpTime},
+     {iat, unix_time()}].
 
 compute_signature(Header, ClaimSet, #'RSAPrivateKey'{publicExponent=Exponent,
                                                     modulus=Modulus,
-                                                    privateExponent=PrivateExponent}) ->
-    base64:encode(crypto:sign(rsa, sha256, <<Header/binary, ".", ClaimSet/binary>>, 
-                                [Exponent, Modulus, PrivateExponent])).
+                                                    privateExponent=PrivateExp}) ->
+    HeaderClaimSet = <<Header/binary, ".", ClaimSet/binary>>,
+    Key = [Exponent, Modulus, PrivateExp],
+    base64:encode(crypto:sign(rsa, sha256, HeaderClaimSet, Key)).
 
 
-make_http_req(Method, Url, ContType, Body) ->
-case httpc:request(Method, {binary_to_list(Url), [], ContType, Body},[],[]) of
-    {ok, {{"HTTP/1.1",200, _State}, _Head, ResponseBody}} ->
-%%        io:format("Body :~p~n~n",[ResponseBody]),
-        jsx:decode(list_to_binary(ResponseBody));
-    {ok, {{"HTTP/1.1",_ResponseCode, _State}, _Head, ResponseBody}} ->
-%%        io:format("Response code : ~p~n Body :~p~n~n",[ResponseCode, ResponseBody]),
-         jsx:decode(list_to_binary(ResponseBody));
-    {error,Reason} ->
-        io:format("~nError Resason : ~p~n",[Reason]),
-        {error,Reason}
-  end.
+http_req(Method, Url, ContType, Body) ->
+    Request = {binary_to_list(Url), [], ContType, Body},
+    OptsReq = [{body_format, binary}],
+    case httpc:request(Method, Request, [{ssl, [{verify, 0}]}], OptsReq) of
+        {ok, {{_ ,200, _State}, _Head, ResponseBody}} ->
+            jsx:decode(ResponseBody);
+        {ok, {{_ ,_ResponseCode, _State}, _Head, ResponseBody}} ->
+            jsx:decode(ResponseBody);
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+unix_time() ->
+    UTC = calendar:universal_time(),
+    calendar:datetime_to_gregorian_seconds(UTC) - 62167219200.
 
