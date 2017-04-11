@@ -1,6 +1,6 @@
 {application, oauth2_s2s, [
 	{description, "Google API OAuth 2.0 for Server to Server Applications"},
-	{vsn, "0.2.0"},
+	{vsn, "0.2.1"},
 	{id, "git"},
 	{modules, []},
 	{registered, []},
